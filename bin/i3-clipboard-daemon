@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+import fcntl
+import json
+import subprocess
+import time
+from pathlib import Path
+
+
+HISTORY_DIR = Path.home() / ".local/share/i3-clipboard"
+HISTORY_FILE = HISTORY_DIR / "history.json"
+LOCK_FILE = Path.home() / ".cache/i3-clipboard-daemon.lock"
+MAX_ITEMS = 80
+MAX_TEXT_BYTES = 200_000
+POLL_SECONDS = 0.8
+
+
+def read_clipboard():
+    try:
+        result = subprocess.run(
+            ["xclip", "-selection", "clipboard", "-o", "-t", "UTF8_STRING"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=0.4,
+        )
+    except Exception:
+        return None
+
+    if result.returncode != 0 or not result.stdout:
+        return None
+
+    if len(result.stdout) > MAX_TEXT_BYTES:
+        return None
+
+    try:
+        text = result.stdout.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+    text = text.replace("\r\n", "\n")
+    return text if text.strip() else None
+
+
+def load_history():
+    try:
+        return json.loads(HISTORY_FILE.read_text())
+    except Exception:
+        return []
+
+
+def save_history(items):
+    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = HISTORY_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(items[:MAX_ITEMS], ensure_ascii=False, indent=2))
+    tmp.replace(HISTORY_FILE)
+
+
+def add_item(text):
+    items = load_history()
+    items = [item for item in items if item.get("text") != text]
+    items.insert(0, {"time": int(time.time()), "text": text})
+    save_history(items)
+
+
+def main():
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    lock = LOCK_FILE.open("w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return 0
+
+    last = None
+    while True:
+        text = read_clipboard()
+        if text and text != last:
+            add_item(text)
+            last = text
+        time.sleep(POLL_SECONDS)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
