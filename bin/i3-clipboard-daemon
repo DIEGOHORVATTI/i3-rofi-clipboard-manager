@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import fcntl
+import hashlib
 import json
 import subprocess
 import time
@@ -8,13 +9,32 @@ from pathlib import Path
 
 HISTORY_DIR = Path.home() / ".local/share/i3-clipboard"
 HISTORY_FILE = HISTORY_DIR / "history.json"
+IMAGES_DIR = HISTORY_DIR / "images"
 LOCK_FILE = Path.home() / ".cache/i3-clipboard-daemon.lock"
 MAX_ITEMS = 80
 MAX_TEXT_BYTES = 200_000
+MAX_IMAGE_BYTES = 20_000_000
 POLL_SECONDS = 0.8
 
 
-def read_clipboard():
+def clipboard_targets():
+    try:
+        result = subprocess.run(
+            ["xclip", "-selection", "clipboard", "-o", "-t", "TARGETS"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=0.4,
+        )
+    except Exception:
+        return set()
+
+    if result.returncode != 0:
+        return set()
+
+    return {line.strip() for line in result.stdout.decode("utf-8", "ignore").splitlines()}
+
+
+def read_text_clipboard():
     try:
         result = subprocess.run(
             ["xclip", "-selection", "clipboard", "-o", "-t", "UTF8_STRING"],
@@ -40,6 +60,63 @@ def read_clipboard():
     return text if text.strip() else None
 
 
+def read_png_clipboard():
+    try:
+        result = subprocess.run(
+            ["xclip", "-selection", "clipboard", "-o", "-t", "image/png"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=1.0,
+        )
+    except Exception:
+        return None
+
+    if result.returncode != 0 or not result.stdout:
+        return None
+
+    if len(result.stdout) > MAX_IMAGE_BYTES:
+        return None
+
+    if not result.stdout.startswith(b"\x89PNG\r\n\x1a\n"):
+        return None
+
+    return result.stdout
+
+
+def png_size(data):
+    if len(data) < 24 or not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return None, None
+    return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+
+
+def read_clipboard():
+    targets = clipboard_targets()
+    if "image/png" in targets:
+        image = read_png_clipboard()
+        if image:
+            digest = hashlib.sha256(image).hexdigest()
+            width, height = png_size(image)
+            return {
+                "type": "image",
+                "hash": digest,
+                "data": image,
+                "width": width,
+                "height": height,
+                "size": len(image),
+            }
+
+    if "UTF8_STRING" in targets or "text/plain" in targets or "TEXT" in targets:
+        text = read_text_clipboard()
+        if text:
+            return {
+                "type": "text",
+                "hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                "text": text,
+            }
+
+    return None
+
+
 def load_history():
     try:
         return json.loads(HISTORY_FILE.read_text())
@@ -52,12 +129,57 @@ def save_history(items):
     tmp = HISTORY_FILE.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(items[:MAX_ITEMS], ensure_ascii=False, indent=2))
     tmp.replace(HISTORY_FILE)
+    cleanup_images(items[:MAX_ITEMS])
 
 
-def add_item(text):
+def cleanup_images(items):
+    used = {
+        Path(item["path"]).name
+        for item in items
+        if item.get("type") == "image" and item.get("path")
+    }
+    if not IMAGES_DIR.exists():
+        return
+    for path in IMAGES_DIR.glob("*.png"):
+        if path.name not in used:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
+def add_item(item):
     items = load_history()
-    items = [item for item in items if item.get("text") != text]
-    items.insert(0, {"time": int(time.time()), "text": text})
+    item_type = item.get("type")
+    digest = item.get("hash")
+
+    if item_type == "image":
+        IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+        image_path = IMAGES_DIR / f"{digest}.png"
+        if not image_path.exists():
+            image_path.write_bytes(item["data"])
+
+        item = {
+            "type": "image",
+            "time": int(time.time()),
+            "hash": digest,
+            "path": str(image_path),
+            "width": item.get("width"),
+            "height": item.get("height"),
+            "size": item.get("size"),
+        }
+    elif item_type == "text":
+        item = {
+            "type": "text",
+            "time": int(time.time()),
+            "hash": digest,
+            "text": item.get("text", ""),
+        }
+    else:
+        return
+
+    items = [old for old in items if old.get("hash") != digest]
+    items.insert(0, item)
     save_history(items)
 
 
@@ -69,12 +191,12 @@ def main():
     except BlockingIOError:
         return 0
 
-    last = None
+    last_hash = None
     while True:
-        text = read_clipboard()
-        if text and text != last:
-            add_item(text)
-            last = text
+        item = read_clipboard()
+        if item and item.get("hash") != last_hash:
+            add_item(item)
+            last_hash = item.get("hash")
         time.sleep(POLL_SECONDS)
 
 
